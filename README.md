@@ -1,3 +1,6 @@
+
+逻辑叠加入场策略是：初始版本
+ 下面第二版本正式公布
 Logic Stack Entry 2.0 Public Preview 0.1.4
 
 这是 Logic Stack Entry 2.0 的第一版公开预览。
