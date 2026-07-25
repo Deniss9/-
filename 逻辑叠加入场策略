@@ -1,0 +1,643 @@
+//@version=5
+indicator("Logic Stack Entry / 逻辑叠加入场评分系统", shorttitle="Logic Stack Entry", overlay=true, max_labels_count=300)
+
+//=============================================================================
+// 设计说明
+// 1) 本指标只做入场理由评分，不自动下单。
+// 2) 4H 通道与 15m 连续 K 线均只读取“上一根已完成”的对应周期 K 线，避免重绘。
+// 3) RSI / MACD 背离使用确认后的价格枢轴；因此会延迟 pivotRight 根 K 线确认，这是不重绘的必要代价。
+// 4) 缺口、整数位、跌不动/涨不动属于近似量化定义，具体规则见对应注释。
+//=============================================================================
+
+//-----------------------------------------------------------------------------
+// 参数分组
+//-----------------------------------------------------------------------------
+string GRP_CHANNEL = "01. 大级别通道"
+string GRP_LEVELS  = "02. 手动支撑 / 压力"
+string GRP_PATTERN = "03. K线与成交量"
+string GRP_DIV     = "04. 背离与动能"
+string GRP_RISK    = "05. 止损、止盈与盈亏比"
+string GRP_WEIGHT  = "06. 评分权重"
+string GRP_SIGNAL  = "07. 信号与显示"
+
+//-----------------------------------------------------------------------------
+// 01. 大级别线性回归通道
+//-----------------------------------------------------------------------------
+channelMode      = input.string("自动+手动", "结构模式", options=["自动", "手动", "自动+手动"], group=GRP_CHANNEL)
+channelTimeframe = input.timeframe("240", "通道周期（默认 4H）", group=GRP_CHANNEL)
+channelLookback  = input.int(100, "回归回看长度", minval=20, maxval=500, group=GRP_CHANNEL)
+channelDeviation = input.float(2.0, "通道标准差倍数", minval=0.5, maxval=5.0, step=0.1, group=GRP_CHANNEL)
+channelNearAtr   = input.float(0.35, "靠近通道：ATR 倍数", minval=0.05, maxval=3.0, step=0.05, group=GRP_CHANNEL)
+showChannel      = input.bool(true, "显示通道", group=GRP_CHANNEL)
+
+bool useAutoChannel = channelMode == "自动" or channelMode == "自动+手动"
+bool useManualLevels = channelMode == "手动" or channelMode == "自动+手动"
+
+// 标准的不重绘 HTF 写法：lookahead_on 必须与表达式 [1] 同时使用。
+// 返回的是上一根已经收盘的高周期回归值，而不是尚在形成的 4H 值。
+[confirmedChannelBasis, confirmedChannelDev, confirmedChannelSlope] = request.security(
+     syminfo.tickerid,
+     channelTimeframe,
+     [
+         ta.linreg(close, channelLookback, 0)[1],
+         ta.stdev(close - ta.linreg(close, channelLookback, 0), channelLookback)[1],
+         (ta.linreg(close, channelLookback, 0) - ta.linreg(close, channelLookback, 1))[1]
+     ],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+float channelMid   = useAutoChannel ? confirmedChannelBasis : na
+float channelUpper = useAutoChannel ? confirmedChannelBasis + confirmedChannelDev * channelDeviation : na
+float channelLower = useAutoChannel ? confirmedChannelBasis - confirmedChannelDev * channelDeviation : na
+bool channelReady  = useAutoChannel and not na(channelUpper) and not na(channelLower)
+
+//-----------------------------------------------------------------------------
+// 02. 手动结构位与自动参考位
+// 0 表示关闭该手动价位。
+//-----------------------------------------------------------------------------
+support1    = input.float(0.0, "支撑 1（0=关闭）", minval=0.0, group=GRP_LEVELS, inline="S1")
+support2    = input.float(0.0, "支撑 2", minval=0.0, group=GRP_LEVELS, inline="S2")
+support3    = input.float(0.0, "支撑 3", minval=0.0, group=GRP_LEVELS, inline="S3")
+resistance1 = input.float(0.0, "压力 1（0=关闭）", minval=0.0, group=GRP_LEVELS, inline="R1")
+resistance2 = input.float(0.0, "压力 2", minval=0.0, group=GRP_LEVELS, inline="R2")
+resistance3 = input.float(0.0, "压力 3", minval=0.0, group=GRP_LEVELS, inline="R3")
+referenceLookback = input.int(50, "前高 / 前低回看", minval=5, maxval=500, group=GRP_LEVELS)
+roundStep         = input.float(100.0, "整数位间距（按品种调整）", minval=0.00000001, group=GRP_LEVELS)
+zoneAtrTolerance  = input.float(0.30, "结构位容差：ATR 倍数", minval=0.05, maxval=3.0, step=0.05, group=GRP_LEVELS)
+zonePctTolerance  = input.float(0.15, "结构位容差：价格百分比", minval=0.01, maxval=5.0, step=0.01, group=GRP_LEVELS)
+showManualLevels  = input.bool(true, "显示手动支撑 / 压力", group=GRP_LEVELS)
+
+//-----------------------------------------------------------------------------
+// 03. K线、确认周期与成交量
+//-----------------------------------------------------------------------------
+wickBodyRatio       = input.float(1.8, "长影线 / 实体最小倍数", minval=0.5, maxval=10.0, step=0.1, group=GRP_PATTERN)
+wickRangePct        = input.float(0.45, "影线占整根 K 线最小比例", minval=0.10, maxval=0.90, step=0.05, group=GRP_PATTERN)
+confirmTimeframe    = input.timeframe("15", "小周期确认周期（默认 15m）", group=GRP_PATTERN)
+confirmSource       = input.string("当前或15m", "连续 K 线来源", options=["当前周期", "15m确认", "当前或15m"], group=GRP_PATTERN)
+confirmBars         = input.int(2, "连续阳线 / 阴线根数", minval=2, maxval=5, group=GRP_PATTERN)
+keyEmaLength        = input.int(20, "短线关键位 EMA", minval=2, maxval=200, group=GRP_PATTERN)
+volumeLength        = input.int(20, "成交量均线长度", minval=2, maxval=200, group=GRP_PATTERN)
+volumeMultiplier    = input.float(1.5, "放量倍数", minval=1.0, maxval=10.0, step=0.1, group=GRP_PATTERN)
+noBreakLookback     = input.int(5, "放量不破高低回看", minval=2, maxval=50, group=GRP_PATTERN)
+
+//-----------------------------------------------------------------------------
+// 04. RSI / MACD 背离与动能
+//-----------------------------------------------------------------------------
+rsiLength           = input.int(14, "RSI 长度", minval=2, maxval=100, group=GRP_DIV)
+macdFast            = input.int(12, "MACD 快线", minval=2, maxval=100, group=GRP_DIV, inline="MACD")
+macdSlow            = input.int(26, "慢线", minval=3, maxval=200, group=GRP_DIV, inline="MACD")
+macdSignal          = input.int(9, "信号线", minval=2, maxval=100, group=GRP_DIV, inline="MACD")
+pivotLeft           = input.int(5, "背离枢轴左侧", minval=1, maxval=20, group=GRP_DIV, inline="PIV")
+pivotRight          = input.int(5, "右侧确认", minval=1, maxval=20, group=GRP_DIV, inline="PIV")
+divergenceValidBars = input.int(12, "背离信号有效 K 线数", minval=1, maxval=100, group=GRP_DIV)
+structureValidBars  = input.int(10, "更高低点 / 更低高点有效数", minval=1, maxval=100, group=GRP_DIV)
+momentumLookback    = input.int(2, "动能减弱确认长度", minval=1, maxval=10, group=GRP_DIV)
+
+//-----------------------------------------------------------------------------
+// 05. 风险、止损与止盈
+//-----------------------------------------------------------------------------
+atrLength            = input.int(14, "ATR 长度", minval=2, maxval=200, group=GRP_RISK)
+atrStopMultiplier    = input.float(1.5, "ATR 止损倍数", minval=0.1, maxval=10.0, step=0.1, group=GRP_RISK)
+stopBufferAtr        = input.float(0.15, "结构止损缓冲 ATR", minval=0.0, maxval=3.0, step=0.05, group=GRP_RISK)
+swingLookback        = input.int(20, "Swing 止损回看", minval=2, maxval=500, group=GRP_RISK)
+stopMethod           = input.string("自动结构", "止损方法", options=["自动结构", "最近摆动", "通道外侧", "ATR", "手动"], group=GRP_RISK)
+manualLongStop       = input.float(0.0, "手动多头止损（0=关闭）", minval=0.0, group=GRP_RISK)
+manualShortStop      = input.float(0.0, "手动空头止损（0=关闭）", minval=0.0, group=GRP_RISK)
+maxStopDistanceAtr   = input.float(3.0, "最大止损距离：ATR 倍数", minval=0.2, maxval=20.0, step=0.1, group=GRP_RISK)
+minRiskReward        = input.float(1.8, "最低盈亏比", minval=0.2, maxval=20.0, step=0.1, group=GRP_RISK)
+rrTargetChoice       = input.string("TP2", "盈亏比使用目标", options=["TP1", "TP2", "TP3"], group=GRP_RISK)
+
+longTP1Input  = input.float(0.0, "手动多头 TP1（0=自动）", minval=0.0, group=GRP_RISK)
+longTP2Input  = input.float(0.0, "手动多头 TP2（0=自动）", minval=0.0, group=GRP_RISK)
+longTP3Input  = input.float(0.0, "手动多头 TP3（0=自动）", minval=0.0, group=GRP_RISK)
+shortTP1Input = input.float(0.0, "手动空头 TP1（0=自动）", minval=0.0, group=GRP_RISK)
+shortTP2Input = input.float(0.0, "手动空头 TP2（0=自动）", minval=0.0, group=GRP_RISK)
+shortTP3Input = input.float(0.0, "手动空头 TP3（0=自动）", minval=0.0, group=GRP_RISK)
+showRiskLines = input.bool(true, "显示动态止损 / TP", group=GRP_RISK)
+
+//-----------------------------------------------------------------------------
+// 06. 权重。默认值对应需求表；动能和结构各补充 1 分。
+//-----------------------------------------------------------------------------
+wChannel   = input.int(2, "靠近通道边缘", minval=0, maxval=10, group=GRP_WEIGHT)
+wSweep     = input.int(3, "刺破结构后收回", minval=0, maxval=10, group=GRP_WEIGHT)
+wLevel     = input.int(1, "靠近支撑 / 压力", minval=0, maxval=10, group=GRP_WEIGHT)
+wWick      = input.int(2, "长影线", minval=0, maxval=10, group=GRP_WEIGHT)
+wSequence  = input.int(2, "连续确认 K 线", minval=0, maxval=10, group=GRP_WEIGHT)
+wReclaim   = input.int(2, "重新站回 / 跌回关键位", minval=0, maxval=10, group=GRP_WEIGHT)
+wRsiDiv    = input.int(2, "RSI 背离", minval=0, maxval=10, group=GRP_WEIGHT)
+wMacdDiv   = input.int(2, "MACD 背离", minval=0, maxval=10, group=GRP_WEIGHT)
+wVolume    = input.int(1, "放量不破高低", minval=0, maxval=10, group=GRP_WEIGHT)
+wMomentum  = input.int(1, "反向动能减弱", minval=0, maxval=10, group=GRP_WEIGHT)
+wStructure = input.int(1, "更高低点 / 更低高点", minval=0, maxval=10, group=GRP_WEIGHT)
+wRR        = input.int(1, "盈亏比合理", minval=0, maxval=10, group=GRP_WEIGHT)
+
+//-----------------------------------------------------------------------------
+// 07. 显示与标签节流
+//-----------------------------------------------------------------------------
+showSignalLabels = input.bool(true, "显示信号标签", group=GRP_SIGNAL)
+showEntryMarkers = input.bool(true, "显示右侧确认 / 强信号三角", group=GRP_SIGNAL)
+labelCooldown    = input.int(12, "同方向标签最小间隔 K 线", minval=1, maxval=500, group=GRP_SIGNAL)
+tablePositionIn  = input.string("右上", "评分表位置", options=["右上", "右下", "左上", "左下"], group=GRP_SIGNAL)
+
+//=============================================================================
+// 通用函数
+//=============================================================================
+f_enabledLevel(float _level) =>
+    not na(_level) and _level > 0
+
+f_nearLevel(float _price, float _level, float _tolerance) =>
+    f_enabledLevel(_level) and math.abs(_price - _level) <= _tolerance
+
+f_bullSweep(float _level) =>
+    f_enabledLevel(_level) and low < _level and close > _level
+
+f_bearSweep(float _level) =>
+    f_enabledLevel(_level) and high > _level and close < _level
+
+f_brokenBelow(float _level) =>
+    f_enabledLevel(_level) and close < _level and close[1] < _level
+
+f_brokenAbove(float _level) =>
+    f_enabledLevel(_level) and close > _level and close[1] > _level
+
+f_bullStreak(int _bars) =>
+    ta.barssince(close <= open) >= _bars
+
+f_bearStreak(int _bars) =>
+    ta.barssince(close >= open) >= _bars
+
+f_recent(bool _event, int _validBars) =>
+    int _since = ta.barssince(_event)
+    not na(_since) and _since <= _validBars
+
+f_addReason(string _base, bool _condition, string _reason) =>
+    _condition ? (_base == "" ? _reason : _base + "、" + _reason) : _base
+
+f_nearestAbove(float _entry, float _a, float _b, float _c, float _d, float _e) =>
+    float _best = na
+    if f_enabledLevel(_a) and _a > _entry
+        _best := _a
+    if f_enabledLevel(_b) and _b > _entry and (na(_best) or _b < _best)
+        _best := _b
+    if f_enabledLevel(_c) and _c > _entry and (na(_best) or _c < _best)
+        _best := _c
+    if f_enabledLevel(_d) and _d > _entry and (na(_best) or _d < _best)
+        _best := _d
+    if f_enabledLevel(_e) and _e > _entry and (na(_best) or _e < _best)
+        _best := _e
+    _best
+
+f_nearestBelow(float _entry, float _a, float _b, float _c, float _d, float _e) =>
+    float _best = na
+    if f_enabledLevel(_a) and _a < _entry
+        _best := _a
+    if f_enabledLevel(_b) and _b < _entry and (na(_best) or _b > _best)
+        _best := _b
+    if f_enabledLevel(_c) and _c < _entry and (na(_best) or _c > _best)
+        _best := _c
+    if f_enabledLevel(_d) and _d < _entry and (na(_best) or _d > _best)
+        _best := _d
+    if f_enabledLevel(_e) and _e < _entry and (na(_best) or _e > _best)
+        _best := _e
+    _best
+
+f_pickTarget(string _choice, float _tp1, float _tp2, float _tp3) =>
+    switch _choice
+        "TP1" => _tp1
+        "TP3" => _tp3
+        => _tp2
+
+f_scoreCode(int _score) =>
+    _score >= 10 ? 4 : _score >= 8 ? 3 : _score >= 6 ? 2 : _score >= 4 ? 1 : 0
+
+f_longState(int _score, bool _forbidden) =>
+    _forbidden ? "禁止做多 / 等待" : _score >= 10 ? "强多信号" : _score >= 8 ? "多头右侧确认" : _score >= 6 ? "多头左侧小仓" : _score >= 4 ? "多头观察" : "不入场"
+
+f_shortState(int _score, bool _forbidden) =>
+    _forbidden ? "禁止做空 / 等待" : _score >= 10 ? "强空信号" : _score >= 8 ? "空头右侧确认" : _score >= 6 ? "空头左侧小仓" : _score >= 4 ? "空头观察" : "不入场"
+
+f_action(int _score, bool _forbidden, bool _isLong) =>
+    string _side = _isLong ? "多" : "空"
+    _forbidden ? "风险不合格，等待" : _score >= 10 ? "强理由；仍须按止损执行" : _score >= 8 ? _side + "头右侧确认，可等回踩" : _score >= 6 ? _side + "头左侧，仅小仓试错" : _score >= 4 ? "加入观察，不抢跑" : "没有足够理由，不入场"
+
+f_fmt(float _value) =>
+    na(_value) ? "N/A" : str.tostring(_value, format.mintick)
+
+f_fmtRR(float _value) =>
+    na(_value) ? "N/A" : str.tostring(_value, "#.##")
+
+//=============================================================================
+// 基础数据与结构参考
+//=============================================================================
+float atr       = ta.atr(atrLength)
+float zoneTol   = math.max(atr * zoneAtrTolerance, math.abs(close) * zonePctTolerance / 100.0)
+float channelTol = atr * channelNearAtr
+float keyLevel  = ta.ema(close, keyEmaLength)
+float volumeMA  = ta.sma(volume, volumeLength)
+
+float priorLow  = ta.lowest(low, referenceLookback)[1]
+float priorHigh = ta.highest(high, referenceLookback)[1]
+
+// 缺口近似：只识别影线之间的传统 gap；24/7 市场出现频率会较低。
+float gapSupport    = ta.valuewhen(low > high[1], high[1], 0)
+float gapResistance = ta.valuewhen(high < low[1], low[1], 0)
+
+float roundSupport = math.floor(close / roundStep) * roundStep
+float roundResistanceRaw = math.ceil(close / roundStep) * roundStep
+float roundResistance = roundResistanceRaw <= close + syminfo.mintick * 0.5 ? roundResistanceRaw + roundStep : roundResistanceRaw
+float roundSupportAdjusted = roundSupport >= close - syminfo.mintick * 0.5 ? roundSupport - roundStep : roundSupport
+
+float candleRange = math.max(high - low, syminfo.mintick)
+float candleBody  = math.max(math.abs(close - open), syminfo.mintick)
+float lowerWick   = math.min(open, close) - low
+float upperWick   = high - math.max(open, close)
+bool longLowerWick = lowerWick >= candleBody * wickBodyRatio and lowerWick / candleRange >= wickRangePct
+bool shortUpperWick = upperWick >= candleBody * wickBodyRatio and upperWick / candleRange >= wickRangePct
+
+bool bullStreakCurrent = f_bullStreak(confirmBars)
+bool bearStreakCurrent = f_bearStreak(confirmBars)
+
+// 15m（或用户指定周期）同样只采用上一根已收盘 K 线的确认结果。
+[bullStreakLtf, bearStreakLtf] = request.security(
+     syminfo.tickerid,
+     confirmTimeframe,
+     [f_bullStreak(confirmBars)[1], f_bearStreak(confirmBars)[1]],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+bool bullSequence = confirmSource == "当前周期" ? bullStreakCurrent : confirmSource == "15m确认" ? bullStreakLtf : bullStreakCurrent or bullStreakLtf
+bool bearSequence = confirmSource == "当前周期" ? bearStreakCurrent : confirmSource == "15m确认" ? bearStreakLtf : bearStreakCurrent or bearStreakLtf
+
+bool reclaimKey = ta.crossover(close, keyLevel)
+bool loseKey    = ta.crossunder(close, keyLevel)
+
+// 通道边缘与中性区
+bool nearChannelLower = channelReady and math.abs(close - channelLower) <= channelTol
+bool nearChannelUpper = channelReady and math.abs(close - channelUpper) <= channelTol
+bool nearChannelMid   = channelReady and math.abs(close - channelMid) <= channelTol
+
+// 手动位、前高低、最近缺口和整数位合并为一条“结构位理由”，避免重复加分。
+bool nearManualSupport = useManualLevels and (f_nearLevel(close, support1, zoneTol) or f_nearLevel(close, support2, zoneTol) or f_nearLevel(close, support3, zoneTol))
+bool nearManualResistance = useManualLevels and (f_nearLevel(close, resistance1, zoneTol) or f_nearLevel(close, resistance2, zoneTol) or f_nearLevel(close, resistance3, zoneTol))
+bool nearAutoSupport = f_nearLevel(close, priorLow, zoneTol) or f_nearLevel(close, gapSupport, zoneTol) or f_nearLevel(close, roundSupport, zoneTol) or f_nearLevel(close, roundSupportAdjusted, zoneTol)
+bool nearAutoResistance = f_nearLevel(close, priorHigh, zoneTol) or f_nearLevel(close, gapResistance, zoneTol) or f_nearLevel(close, roundResistance, zoneTol) or f_nearLevel(close, roundResistanceRaw, zoneTol)
+bool nearSupport = nearManualSupport or nearAutoSupport
+bool nearResistance = nearManualResistance or nearAutoResistance
+
+// “刺破后收回”：当根最低/最高越过结构，收盘重新回到结构内侧。
+bool sweepChannelLower = channelReady and low < channelLower and close > channelLower
+bool sweepChannelUpper = channelReady and high > channelUpper and close < channelUpper
+bool sweepSupport = sweepChannelLower or f_bullSweep(priorLow) or f_bullSweep(gapSupport) or f_bullSweep(roundSupport) or (useManualLevels and (f_bullSweep(support1) or f_bullSweep(support2) or f_bullSweep(support3)))
+bool sweepResistance = sweepChannelUpper or f_bearSweep(priorHigh) or f_bearSweep(gapResistance) or f_bearSweep(roundResistanceRaw) or (useManualLevels and (f_bearSweep(resistance1) or f_bearSweep(resistance2) or f_bearSweep(resistance3)))
+
+// 放量但不破近期低/高：属于“吸收 / 推进失败”的近似判断。
+float priorNoBreakLow  = ta.lowest(low, noBreakLookback)[1]
+float priorNoBreakHigh = ta.highest(high, noBreakLookback)[1]
+bool volumeExpanded = volume > volumeMA * volumeMultiplier
+bool volumeDownNoLow = close < open and volumeExpanded and low >= priorNoBreakLow
+bool volumeUpNoHigh  = close > open and volumeExpanded and high <= priorNoBreakHigh
+
+// 连续放量单边 K 线用于风险否决，不参与正向评分。
+bool bearVolumeImpulse = bearStreakCurrent and close < close[confirmBars] and volumeExpanded
+bool bullVolumeImpulse = bullStreakCurrent and close > close[confirmBars] and volumeExpanded
+
+//=============================================================================
+// RSI / MACD 背离（确认式枢轴，不回画到过去）
+//=============================================================================
+float rsi = ta.rsi(close, rsiLength)
+[macdLine, macdSignalLine, macdHistogram] = ta.macd(close, macdFast, macdSlow, macdSignal)
+
+float pricePivotLow  = ta.pivotlow(low, pivotLeft, pivotRight)
+float pricePivotHigh = ta.pivothigh(high, pivotLeft, pivotRight)
+
+float previousPivotLow  = ta.valuewhen(not na(pricePivotLow), pricePivotLow, 1)
+float previousPivotHigh = ta.valuewhen(not na(pricePivotHigh), pricePivotHigh, 1)
+float previousRsiAtLow  = ta.valuewhen(not na(pricePivotLow), rsi[pivotRight], 1)
+float previousRsiAtHigh = ta.valuewhen(not na(pricePivotHigh), rsi[pivotRight], 1)
+float previousMacdAtLow = ta.valuewhen(not na(pricePivotLow), macdHistogram[pivotRight], 1)
+float previousMacdAtHigh = ta.valuewhen(not na(pricePivotHigh), macdHistogram[pivotRight], 1)
+
+bool bullRsiDivEvent = not na(pricePivotLow) and not na(previousPivotLow) and pricePivotLow < previousPivotLow and rsi[pivotRight] > previousRsiAtLow
+bool bearRsiDivEvent = not na(pricePivotHigh) and not na(previousPivotHigh) and pricePivotHigh > previousPivotHigh and rsi[pivotRight] < previousRsiAtHigh
+bool bullMacdDivEvent = not na(pricePivotLow) and not na(previousPivotLow) and pricePivotLow < previousPivotLow and macdHistogram[pivotRight] > previousMacdAtLow
+bool bearMacdDivEvent = not na(pricePivotHigh) and not na(previousPivotHigh) and pricePivotHigh > previousPivotHigh and macdHistogram[pivotRight] < previousMacdAtHigh
+
+bool bullRsiDiv  = f_recent(bullRsiDivEvent, divergenceValidBars)
+bool bearRsiDiv  = f_recent(bearRsiDivEvent, divergenceValidBars)
+bool bullMacdDiv = f_recent(bullMacdDivEvent, divergenceValidBars)
+bool bearMacdDiv = f_recent(bearMacdDivEvent, divergenceValidBars)
+
+bool higherLowEvent = not na(pricePivotLow) and not na(previousPivotLow) and pricePivotLow > previousPivotLow
+bool lowerHighEvent = not na(pricePivotHigh) and not na(previousPivotHigh) and pricePivotHigh < previousPivotHigh
+bool higherLow = f_recent(higherLowEvent, structureValidBars)
+bool lowerHigh = f_recent(lowerHighEvent, structureValidBars)
+
+// MACD 柱仍在零轴反方向，但连续向零轴收缩，近似表示下跌/上涨动能减弱。
+bool bearMomentumWeak = macdHistogram < 0 and ta.rising(macdHistogram, momentumLookback)
+bool bullMomentumWeak = macdHistogram > 0 and ta.falling(macdHistogram, momentumLookback)
+
+//=============================================================================
+// 止损与止盈
+//=============================================================================
+float longSwingStop   = ta.lowest(low, swingLookback) - atr * stopBufferAtr
+float shortSwingStop  = ta.highest(high, swingLookback) + atr * stopBufferAtr
+float longChannelStop = channelReady ? channelLower - atr * stopBufferAtr : na
+float shortChannelStop = channelReady ? channelUpper + atr * stopBufferAtr : na
+float longAtrStop     = close - atr * atrStopMultiplier
+float shortAtrStop    = close + atr * atrStopMultiplier
+
+// 自动结构模式选择更保守（离入场更远）的有效结构外侧。
+float longAutoStop = longSwingStop
+if channelReady
+    longAutoStop := math.min(longAutoStop, longChannelStop)
+float shortAutoStop = shortSwingStop
+if channelReady
+    shortAutoStop := math.max(shortAutoStop, shortChannelStop)
+
+float longStopCandidate = switch stopMethod
+    "最近摆动" => longSwingStop
+    "通道外侧" => channelReady ? longChannelStop : longSwingStop
+    "ATR" => longAtrStop
+    "手动" => manualLongStop > 0 ? manualLongStop : longAutoStop
+    => longAutoStop
+
+float shortStopCandidate = switch stopMethod
+    "最近摆动" => shortSwingStop
+    "通道外侧" => channelReady ? shortChannelStop : shortSwingStop
+    "ATR" => shortAtrStop
+    "手动" => manualShortStop > 0 ? manualShortStop : shortAutoStop
+    => shortAutoStop
+
+// 自动目标：TP1 中轨、TP2 对侧通道、TP3 最近手动/结构压力（空头反向）。
+float nearestLongResistance = f_nearestAbove(close, resistance1, resistance2, resistance3, priorHigh, roundResistance)
+float nearestShortSupport    = f_nearestBelow(close, support1, support2, support3, priorLow, roundSupportAdjusted)
+float autoLongTP1  = channelReady and channelMid > close ? channelMid : nearestLongResistance
+float autoLongTP2  = channelReady and channelUpper > close ? channelUpper : nearestLongResistance
+float autoLongTP3  = nearestLongResistance
+float autoShortTP1 = channelReady and channelMid < close ? channelMid : nearestShortSupport
+float autoShortTP2 = channelReady and channelLower < close ? channelLower : nearestShortSupport
+float autoShortTP3 = nearestShortSupport
+
+float longTP1Candidate  = longTP1Input > 0 ? longTP1Input : autoLongTP1
+float longTP2Candidate  = longTP2Input > 0 ? longTP2Input : autoLongTP2
+float longTP3Candidate  = longTP3Input > 0 ? longTP3Input : autoLongTP3
+float shortTP1Candidate = shortTP1Input > 0 ? shortTP1Input : autoShortTP1
+float shortTP2Candidate = shortTP2Input > 0 ? shortTP2Input : autoShortTP2
+float shortTP3Candidate = shortTP3Input > 0 ? shortTP3Input : autoShortTP3
+
+float longRRTarget  = f_pickTarget(rrTargetChoice, longTP1Candidate, longTP2Candidate, longTP3Candidate)
+float shortRRTarget = f_pickTarget(rrTargetChoice, shortTP1Candidate, shortTP2Candidate, shortTP3Candidate)
+
+bool longStopValid  = not na(longStopCandidate) and longStopCandidate < close
+bool shortStopValid = not na(shortStopCandidate) and shortStopCandidate > close
+bool longTargetValid  = not na(longRRTarget) and longRRTarget > close
+bool shortTargetValid = not na(shortRRTarget) and shortRRTarget < close
+float longRisk  = longStopValid ? close - longStopCandidate : na
+float shortRisk = shortStopValid ? shortStopCandidate - close : na
+float longReward  = longTargetValid ? longRRTarget - close : na
+float shortReward = shortTargetValid ? close - shortRRTarget : na
+float longRR  = longStopValid and longTargetValid and longRisk > 0 ? longReward / longRisk : na
+float shortRR = shortStopValid and shortTargetValid and shortRisk > 0 ? shortReward / shortRisk : na
+bool longRRGood  = not na(longRR) and longRR >= minRiskReward
+bool shortRRGood = not na(shortRR) and shortRR >= minRiskReward
+bool longStopTooFar  = not longStopValid or longRisk > atr * maxStopDistanceAtr
+bool shortStopTooFar = not shortStopValid or shortRisk > atr * maxStopDistanceAtr
+
+//=============================================================================
+// 多空评分
+//=============================================================================
+int longScoreBeforeRisk =
+     (nearChannelLower ? wChannel : 0) +
+     (sweepSupport ? wSweep : 0) +
+     (nearSupport ? wLevel : 0) +
+     (longLowerWick ? wWick : 0) +
+     (bullSequence ? wSequence : 0) +
+     (reclaimKey ? wReclaim : 0) +
+     (bullRsiDiv ? wRsiDiv : 0) +
+     (bullMacdDiv ? wMacdDiv : 0) +
+     (volumeDownNoLow ? wVolume : 0) +
+     (bearMomentumWeak ? wMomentum : 0) +
+     (higherLow ? wStructure : 0)
+
+int shortScoreBeforeRisk =
+     (nearChannelUpper ? wChannel : 0) +
+     (sweepResistance ? wSweep : 0) +
+     (nearResistance ? wLevel : 0) +
+     (shortUpperWick ? wWick : 0) +
+     (bearSequence ? wSequence : 0) +
+     (loseKey ? wReclaim : 0) +
+     (bearRsiDiv ? wRsiDiv : 0) +
+     (bearMacdDiv ? wMacdDiv : 0) +
+     (volumeUpNoHigh ? wVolume : 0) +
+     (bullMomentumWeak ? wMomentum : 0) +
+     (lowerHigh ? wStructure : 0)
+
+int longScoreRaw  = longScoreBeforeRisk + (longRRGood and not longStopTooFar ? wRR : 0)
+int shortScoreRaw = shortScoreBeforeRisk + (shortRRGood and not shortStopTooFar ? wRR : 0)
+
+//=============================================================================
+// 禁止追单 / 风险否决
+//=============================================================================
+bool failedSupport = (channelReady and close < channelLower and close[1] < channelLower) or f_brokenBelow(priorLow) or f_brokenBelow(gapSupport) or (useManualLevels and (f_brokenBelow(support1) or f_brokenBelow(support2) or f_brokenBelow(support3)))
+bool failedResistance = (channelReady and close > channelUpper and close[1] > channelUpper) or f_brokenAbove(priorHigh) or f_brokenAbove(gapResistance) or (useManualLevels and (f_brokenAbove(resistance1) or f_brokenAbove(resistance2) or f_brokenAbove(resistance3)))
+
+bool longStructuralBlock = (failedSupport or bearVolumeImpulse) and not longLowerWick and not bullRsiDiv and not bullMacdDiv and longScoreBeforeRisk < 4
+bool shortStructuralBlock = (failedResistance or bullVolumeImpulse) and not shortUpperWick and not bearRsiDiv and not bearMacdDiv and shortScoreBeforeRisk < 4
+bool longForbiddenRaw = longStructuralBlock or longStopTooFar or not longRRGood
+bool shortForbiddenRaw = shortStructuralBlock or shortStopTooFar or not shortRRGood
+bool longBlockContext = nearChannelLower or nearSupport or failedSupport or bearVolumeImpulse
+bool shortBlockContext = nearChannelUpper or nearResistance or failedResistance or bullVolumeImpulse
+
+//=============================================================================
+// 收盘快照：实时 K 线未收盘时保持上一根已确认结果。
+//=============================================================================
+string longReasonsRaw = ""
+longReasonsRaw := f_addReason(longReasonsRaw, nearChannelLower, confirmedChannelSlope >= 0 ? "上升通道下沿" : "下降通道下沿")
+longReasonsRaw := f_addReason(longReasonsRaw, sweepSupport, "刺破支撑收回")
+longReasonsRaw := f_addReason(longReasonsRaw, nearSupport, "支撑/前低/缺口/整数位")
+longReasonsRaw := f_addReason(longReasonsRaw, longLowerWick, "长下影")
+longReasonsRaw := f_addReason(longReasonsRaw, bullSequence, "连续阳线")
+longReasonsRaw := f_addReason(longReasonsRaw, reclaimKey, "站回短线关键位")
+longReasonsRaw := f_addReason(longReasonsRaw, bullRsiDiv, "RSI底背离")
+longReasonsRaw := f_addReason(longReasonsRaw, bullMacdDiv, "MACD底背离")
+longReasonsRaw := f_addReason(longReasonsRaw, volumeDownNoLow, "放量不破低")
+longReasonsRaw := f_addReason(longReasonsRaw, bearMomentumWeak, "下跌动能减弱")
+longReasonsRaw := f_addReason(longReasonsRaw, higherLow, "更高低点")
+longReasonsRaw := f_addReason(longReasonsRaw, longRRGood and not longStopTooFar, "盈亏比合格")
+
+string shortReasonsRaw = ""
+shortReasonsRaw := f_addReason(shortReasonsRaw, nearChannelUpper, confirmedChannelSlope < 0 ? "下降通道上沿" : "上升通道上沿")
+shortReasonsRaw := f_addReason(shortReasonsRaw, sweepResistance, "刺破压力跌回")
+shortReasonsRaw := f_addReason(shortReasonsRaw, nearResistance, "压力/前高/缺口/整数位")
+shortReasonsRaw := f_addReason(shortReasonsRaw, shortUpperWick, "长上影")
+shortReasonsRaw := f_addReason(shortReasonsRaw, bearSequence, "连续阴线")
+shortReasonsRaw := f_addReason(shortReasonsRaw, loseKey, "跌回短线关键位")
+shortReasonsRaw := f_addReason(shortReasonsRaw, bearRsiDiv, "RSI顶背离")
+shortReasonsRaw := f_addReason(shortReasonsRaw, bearMacdDiv, "MACD顶背离")
+shortReasonsRaw := f_addReason(shortReasonsRaw, volumeUpNoHigh, "放量不破高")
+shortReasonsRaw := f_addReason(shortReasonsRaw, bullMomentumWeak, "上涨动能减弱")
+shortReasonsRaw := f_addReason(shortReasonsRaw, lowerHigh, "更低高点")
+shortReasonsRaw := f_addReason(shortReasonsRaw, shortRRGood and not shortStopTooFar, "盈亏比合格")
+
+var int confirmedLongScore = 0
+var int confirmedShortScore = 0
+var bool confirmedLongForbidden = true
+var bool confirmedShortForbidden = true
+var bool confirmedLongBlockContext = false
+var bool confirmedShortBlockContext = false
+var string confirmedLongReasons = "无"
+var string confirmedShortReasons = "无"
+var float confirmedLongStop = na
+var float confirmedShortStop = na
+var float confirmedLongTP1 = na
+var float confirmedLongTP2 = na
+var float confirmedLongTP3 = na
+var float confirmedShortTP1 = na
+var float confirmedShortTP2 = na
+var float confirmedShortTP3 = na
+var float confirmedLongRR = na
+var float confirmedShortRR = na
+
+if barstate.isconfirmed
+    confirmedLongScore := longScoreRaw
+    confirmedShortScore := shortScoreRaw
+    confirmedLongForbidden := longForbiddenRaw
+    confirmedShortForbidden := shortForbiddenRaw
+    confirmedLongBlockContext := longBlockContext
+    confirmedShortBlockContext := shortBlockContext
+    confirmedLongReasons := longReasonsRaw == "" ? "无" : longReasonsRaw
+    confirmedShortReasons := shortReasonsRaw == "" ? "无" : shortReasonsRaw
+    confirmedLongStop := longStopCandidate
+    confirmedShortStop := shortStopCandidate
+    confirmedLongTP1 := longTP1Candidate
+    confirmedLongTP2 := longTP2Candidate
+    confirmedLongTP3 := longTP3Candidate
+    confirmedShortTP1 := shortTP1Candidate
+    confirmedShortTP2 := shortTP2Candidate
+    confirmedShortTP3 := shortTP3Candidate
+    confirmedLongRR := longRR
+    confirmedShortRR := shortRR
+
+int longCodeBase = f_scoreCode(confirmedLongScore)
+int shortCodeBase = f_scoreCode(confirmedShortScore)
+int longCode = confirmedLongForbidden ? -1 : longCodeBase
+int shortCode = confirmedShortForbidden ? -1 : shortCodeBase
+string longState = f_longState(confirmedLongScore, confirmedLongForbidden)
+string shortState = f_shortState(confirmedShortScore, confirmedShortForbidden)
+
+bool hasLongBias = confirmedLongScore >= 4 and confirmedLongScore > confirmedShortScore
+bool hasShortBias = confirmedShortScore >= 4 and confirmedShortScore > confirmedLongScore
+string currentBias = hasLongBias ? "多头偏向" : hasShortBias ? "空头偏向" : nearChannelMid ? "中性 / 通道中轨" : "中性 / 等待"
+string currentState = hasLongBias ? longState : hasShortBias ? shortState : "等待"
+string currentReasons = hasLongBias ? confirmedLongReasons : hasShortBias ? confirmedShortReasons : confirmedLongScore >= confirmedShortScore ? confirmedLongReasons : confirmedShortReasons
+string currentAction = hasLongBias ? f_action(confirmedLongScore, confirmedLongForbidden, true) : hasShortBias ? f_action(confirmedShortScore, confirmedShortForbidden, false) : "多空理由均不足，等待"
+
+//=============================================================================
+// 图表绘制
+//=============================================================================
+color channelColor = color.rgb(70, 130, 220)
+upperPlot = plot(showChannel and channelReady ? channelUpper : na, "通道上轨", color=color.new(channelColor, 5), linewidth=2)
+midPlot   = plot(showChannel and channelReady ? channelMid : na, "通道中轨", color=color.new(color.gray, 25), linewidth=1)
+lowerPlot = plot(showChannel and channelReady ? channelLower : na, "通道下轨", color=color.new(channelColor, 5), linewidth=2)
+fill(upperPlot, lowerPlot, color=color.new(channelColor, 92), title="回归通道填充")
+
+plot(showManualLevels and useManualLevels and support1 > 0 ? support1 : na, "支撑 1", color=color.new(color.lime, 30), linewidth=1, style=plot.style_linebr)
+plot(showManualLevels and useManualLevels and support2 > 0 ? support2 : na, "支撑 2", color=color.new(color.lime, 45), linewidth=1, style=plot.style_linebr)
+plot(showManualLevels and useManualLevels and support3 > 0 ? support3 : na, "支撑 3", color=color.new(color.lime, 60), linewidth=1, style=plot.style_linebr)
+plot(showManualLevels and useManualLevels and resistance1 > 0 ? resistance1 : na, "压力 1", color=color.new(color.red, 30), linewidth=1, style=plot.style_linebr)
+plot(showManualLevels and useManualLevels and resistance2 > 0 ? resistance2 : na, "压力 2", color=color.new(color.red, 45), linewidth=1, style=plot.style_linebr)
+plot(showManualLevels and useManualLevels and resistance3 > 0 ? resistance3 : na, "压力 3", color=color.new(color.red, 60), linewidth=1, style=plot.style_linebr)
+
+plot(showRiskLines ? confirmedLongStop : na, "多头止损", color=color.new(color.red, 0), linewidth=2, style=plot.style_linebr)
+plot(showRiskLines ? confirmedShortStop : na, "空头止损", color=color.new(color.fuchsia, 0), linewidth=2, style=plot.style_linebr)
+plot(showRiskLines ? confirmedLongTP1 : na, "多头 TP1", color=color.new(color.lime, 10), linewidth=1, style=plot.style_linebr)
+plot(showRiskLines ? confirmedLongTP2 : na, "多头 TP2", color=color.new(color.lime, 30), linewidth=1, style=plot.style_linebr)
+plot(showRiskLines ? confirmedLongTP3 : na, "多头 TP3", color=color.new(color.lime, 50), linewidth=1, style=plot.style_linebr)
+plot(showRiskLines ? confirmedShortTP1 : na, "空头 TP1", color=color.new(color.orange, 10), linewidth=1, style=plot.style_linebr)
+plot(showRiskLines ? confirmedShortTP2 : na, "空头 TP2", color=color.new(color.orange, 30), linewidth=1, style=plot.style_linebr)
+plot(showRiskLines ? confirmedShortTP3 : na, "空头 TP3", color=color.new(color.orange, 50), linewidth=1, style=plot.style_linebr)
+
+// 标签只在状态切换时产生，并受冷却 K 线限制，避免每根 K 线刷屏。
+f_longLabelColor(int _code) =>
+    _code == 4 ? color.rgb(0, 255, 80) : _code == 3 ? color.rgb(0, 170, 70) : _code == 2 ? color.rgb(255, 145, 0) : _code == 1 ? color.rgb(245, 210, 20) : color.rgb(105, 105, 105)
+
+f_shortLabelColor(int _code) =>
+    _code == 4 ? color.rgb(130, 0, 0) : _code == 3 ? color.rgb(220, 20, 30) : _code == 2 ? color.rgb(255, 75, 35) : _code == 1 ? color.rgb(255, 150, 150) : color.rgb(105, 105, 105)
+
+var int lastLongLabelBar = na
+var int lastShortLabelBar = na
+var int lastWaitLabelBar = na
+bool longStateChanged = longCode != longCode[1]
+bool shortStateChanged = shortCode != shortCode[1]
+bool longBlockContextStarted = confirmedLongBlockContext and not confirmedLongBlockContext[1]
+bool shortBlockContextStarted = confirmedShortBlockContext and not confirmedShortBlockContext[1]
+bool longLabelEvent = (longCode >= 1 and longStateChanged) or (longCode == -1 and confirmedLongBlockContext and (longStateChanged or longBlockContextStarted))
+bool shortLabelEvent = (shortCode >= 1 and shortStateChanged) or (shortCode == -1 and confirmedShortBlockContext and (shortStateChanged or shortBlockContextStarted))
+bool canLongLabel = na(lastLongLabelBar) or bar_index - lastLongLabelBar >= labelCooldown
+bool canShortLabel = na(lastShortLabelBar) or bar_index - lastShortLabelBar >= labelCooldown
+
+if showSignalLabels and barstate.isconfirmed and longLabelEvent and canLongLabel
+    label.new(bar_index, low - nz(atr, high - low) * 0.20, longState + "\nL=" + str.tostring(confirmedLongScore) + "  RR=" + f_fmtRR(confirmedLongRR), style=label.style_label_up, color=f_longLabelColor(longCode), textcolor=color.white, size=size.small)
+    lastLongLabelBar := bar_index
+
+if showSignalLabels and barstate.isconfirmed and shortLabelEvent and canShortLabel
+    label.new(bar_index, high + nz(atr, high - low) * 0.20, shortState + "\nS=" + str.tostring(confirmedShortScore) + "  RR=" + f_fmtRR(confirmedShortRR), style=label.style_label_down, color=f_shortLabelColor(shortCode), textcolor=color.white, size=size.small)
+    lastShortLabelBar := bar_index
+
+bool hadEntryState = nz(longCode[1], 0) >= 1 or nz(shortCode[1], 0) >= 1
+bool nowWaiting = longCodeBase == 0 and shortCodeBase == 0
+bool canWaitLabel = na(lastWaitLabelBar) or bar_index - lastWaitLabelBar >= labelCooldown
+if showSignalLabels and barstate.isconfirmed and nowWaiting and hadEntryState and canWaitLabel
+    label.new(bar_index, close, "等待", style=label.style_label_left, color=color.new(color.gray, 15), textcolor=color.white, size=size.tiny)
+    lastWaitLabelBar := bar_index
+
+bool newLongConfirm = barstate.isconfirmed and longCode >= 3 and nz(longCode[1], 0) < 3
+bool newShortConfirm = barstate.isconfirmed and shortCode >= 3 and nz(shortCode[1], 0) < 3
+plotshape(showEntryMarkers and newLongConfirm, title="多头右侧确认/强多", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="L")
+plotshape(showEntryMarkers and newShortConfirm, title="空头右侧确认/强空", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="S")
+
+//=============================================================================
+// 右上角（可调位置）评分表
+//=============================================================================
+string tablePosition = switch tablePositionIn
+    "右下" => position.bottom_right
+    "左上" => position.top_left
+    "左下" => position.bottom_left
+    => position.top_right
+
+color longScoreBg = confirmedLongForbidden ? color.new(color.gray, 35) : confirmedLongScore >= 10 ? color.new(color.lime, 10) : confirmedLongScore >= 8 ? color.new(color.green, 20) : confirmedLongScore >= 6 ? color.new(color.orange, 15) : confirmedLongScore >= 4 ? color.new(color.yellow, 15) : color.new(color.gray, 65)
+color shortScoreBg = confirmedShortForbidden ? color.new(color.gray, 35) : confirmedShortScore >= 10 ? color.new(color.maroon, 5) : confirmedShortScore >= 8 ? color.new(color.red, 15) : confirmedShortScore >= 6 ? color.new(color.rgb(255, 80, 35), 15) : confirmedShortScore >= 4 ? color.new(color.rgb(255, 160, 160), 15) : color.new(color.gray, 65)
+
+var table dashboard = table.new(tablePosition, 2, 11, bgcolor=color.new(color.black, 15), frame_color=color.new(color.gray, 35), frame_width=1, border_color=color.new(color.gray, 70), border_width=1)
+
+if barstate.islast
+    table.cell(dashboard, 0, 0, "Logic Stack Entry", text_color=color.white, bgcolor=color.rgb(30, 38, 50), text_size=size.small)
+    table.cell(dashboard, 1, 0, "收盘确认", text_color=color.aqua, bgcolor=color.rgb(30, 38, 50), text_size=size.small)
+    table.cell(dashboard, 0, 1, "Long Score", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 1, str.tostring(confirmedLongScore) + " | " + longState, text_color=color.white, bgcolor=longScoreBg, text_size=size.small)
+    table.cell(dashboard, 0, 2, "Short Score", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 2, str.tostring(confirmedShortScore) + " | " + shortState, text_color=color.white, bgcolor=shortScoreBg, text_size=size.small)
+    table.cell(dashboard, 0, 3, "当前方向偏向", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 3, currentBias, text_color=hasLongBias ? color.lime : hasShortBias ? color.red : color.silver, text_size=size.small)
+    table.cell(dashboard, 0, 4, "当前状态", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 4, currentState, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 0, 5, "触发理由", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 5, currentReasons, text_color=color.white, text_size=size.tiny)
+    table.cell(dashboard, 0, 6, "建议动作", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 6, currentAction, text_color=color.aqua, text_size=size.small)
+    table.cell(dashboard, 0, 7, "多头止损", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 7, f_fmt(confirmedLongStop) + " | RR " + f_fmtRR(confirmedLongRR), text_color=color.lime, text_size=size.small)
+    table.cell(dashboard, 0, 8, "空头止损", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 8, f_fmt(confirmedShortStop) + " | RR " + f_fmtRR(confirmedShortRR), text_color=color.red, text_size=size.small)
+    table.cell(dashboard, 0, 9, "多头 TP", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 9, f_fmt(confirmedLongTP1) + " / " + f_fmt(confirmedLongTP2) + " / " + f_fmt(confirmedLongTP3), text_color=color.lime, text_size=size.small)
+    table.cell(dashboard, 0, 10, "空头 TP", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 10, f_fmt(confirmedShortTP1) + " / " + f_fmt(confirmedShortTP2) + " / " + f_fmt(confirmedShortTP3), text_color=color.orange, text_size=size.small)
+
+//=============================================================================
+// 警报条件：只在已确认收盘且状态首次进入对应等级时触发。
+//=============================================================================
+alertcondition(barstate.isconfirmed and longCode >= 1 and nz(longCode[1], 0) < 1, "Long Watch+", "Logic Stack Entry：多头评分进入观察或更高等级")
+alertcondition(barstate.isconfirmed and longCode >= 3 and nz(longCode[1], 0) < 3, "Long Right Confirm+", "Logic Stack Entry：多头进入右侧确认或强信号")
+alertcondition(barstate.isconfirmed and shortCode >= 1 and nz(shortCode[1], 0) < 1, "Short Watch+", "Logic Stack Entry：空头评分进入观察或更高等级")
+alertcondition(barstate.isconfirmed and shortCode >= 3 and nz(shortCode[1], 0) < 3, "Short Right Confirm+", "Logic Stack Entry：空头进入右侧确认或强信号")
