@@ -1,5 +1,4 @@
-
-逻辑叠加入场策略是：初始版本
+Logic Stack Entry / 逻辑叠加入场评分系统是初始版本
  下面第二版本正式公布
 Logic Stack Entry 2.0 Public Preview 0.1.4
 
